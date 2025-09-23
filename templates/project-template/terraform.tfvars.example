@@ -1,0 +1,65 @@
+# Example Terraform variables file
+# Copy this to terraform.tfvars and customize for your environment
+
+# Core project configuration
+project_name = "my-terraform-project"
+environment  = "dev"  # dev, staging, or prod
+aws_region   = "us-west-2"
+owner        = "Platform Team"
+
+# Default tags applied to all resources
+default_tags = {
+  Terraform   = "true"
+  Repository  = "terraform-fundamentals"
+  CostCenter  = "engineering"
+  Contact     = "platform-team@company.com"
+}
+
+# Security configuration
+allowed_cidr_blocks = [
+  "203.0.113.0/24",  # Office network
+  "198.51.100.0/24"  # VPN network
+]
+
+# Feature flags
+enable_database  = true
+enable_monitoring = true
+enable_backup    = true
+
+# Database configuration
+database_config = {
+  engine         = "mysql"
+  engine_version = "8.0"
+  instance_class = "db.t3.micro"  # Use larger for production
+}
+
+# Application configuration
+application_config = {
+  port              = 8080
+  health_check_path = "/health"
+  protocol          = "HTTP"
+}
+
+# Notification configuration
+notification_config = {
+  email_addresses = [
+    "alerts@company.com",
+    "platform-team@company.com"
+  ]
+  slack_webhook = "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
+}
+
+# Cost optimization settings
+cost_optimization = {
+  enable_spot_instances = false  # Set to true for non-production
+  schedule_scaling      = true   # Scale down during off-hours
+  lifecycle_policies    = true   # Enable S3 lifecycle policies
+}
+
+# Backup configuration
+backup_config = {
+  retention_days      = 7     # Increase for production
+  backup_window      = "03:00-04:00"
+  maintenance_window = "sun:04:00-sun:05:00"
+  enable_cross_region = false  # Enable for production
+}

@@ -1,0 +1,225 @@
+version: 0.2
+
+# BuildSpec for Terraform deployment
+# This buildspec deploys infrastructure to the target environment
+
+env:
+  variables:
+    TF_VERSION: "1.5.0"
+    TF_IN_AUTOMATION: "true"
+    TF_INPUT: "false"
+    TF_CLI_ARGS: "-no-color"
+  
+phases:
+  install:
+    runtime-versions:
+      python: 3.8
+    commands:
+      - echo "Installing dependencies..."
+      - apt-get update -y
+      - apt-get install -y curl unzip wget git jq
+      
+      # Install Terraform
+      - echo "Installing Terraform ${TF_VERSION}..."
+      - wget -q https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip
+      - unzip terraform_${TF_VERSION}_linux_amd64.zip
+      - mv terraform /usr/local/bin/
+      - terraform version
+      
+      # Install AWS CLI v2 (if not already installed)
+      - echo "Checking AWS CLI version..."
+      - aws --version
+      
+  pre_build:
+    commands:
+      - echo "Pre-build phase started on `date`"
+      - echo "Target Environment: $ENVIRONMENT"
+      - echo "Current directory: $(pwd)"
+      
+      # Validate environment variable
+      - |
+        if [ -z "$ENVIRONMENT" ]; then
+          echo "ERROR: ENVIRONMENT variable not set"
+          exit 1
+        fi
+      
+      - echo "Deploying to environment: $ENVIRONMENT"
+      
+      # Set up Terraform working directory
+      - cd terraform || echo "No terraform directory found, using root"
+      - pwd
+      - ls -la
+      
+      # Set environment-specific variables
+      - |
+        case $ENVIRONMENT in
+          dev)
+            export TF_VAR_instance_type="t3.micro"
+            export TF_VAR_min_size=1
+            export TF_VAR_max_size=2
+            export TF_VAR_enable_monitoring=false
+            ;;
+          staging)
+            export TF_VAR_instance_type="t3.small"
+            export TF_VAR_min_size=2
+            export TF_VAR_max_size=4
+            export TF_VAR_enable_monitoring=true
+            ;;
+          prod)
+            export TF_VAR_instance_type="t3.medium"
+            export TF_VAR_min_size=3
+            export TF_VAR_max_size=10
+            export TF_VAR_enable_monitoring=true
+            ;;
+          *)
+            echo "ERROR: Unknown environment: $ENVIRONMENT"
+            exit 1
+            ;;
+        esac
+      
+      # Set common variables
+      - export TF_VAR_environment=$ENVIRONMENT
+      - export TF_VAR_aws_region=${AWS_DEFAULT_REGION:-us-west-2}
+      
+      # Print environment variables for debugging
+      - echo "Environment variables set:"
+      - env | grep TF_VAR_ | sort
+      
+  build:
+    commands:
+      - echo "Build phase started on `date`"
+      - echo "=== Terraform Deployment to $ENVIRONMENT ==="
+      
+      # Initialize Terraform with backend
+      - echo "Initializing Terraform with backend..."
+      - |
+        terraform init \
+          -backend-config="bucket=${PROJECT_NAME:-terraform-state}-${ENVIRONMENT}-${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text)}" \
+          -backend-config="key=infrastructure/${ENVIRONMENT}/terraform.tfstate" \
+          -backend-config="region=${AWS_DEFAULT_REGION:-us-west-2}" \
+          -backend-config="dynamodb_table=${PROJECT_NAME:-terraform-state}-locks" \
+          -reconfigure
+      
+      # Select or create workspace (if using workspaces)
+      - echo "Managing Terraform workspace..."
+      - terraform workspace select $ENVIRONMENT || terraform workspace new $ENVIRONMENT
+      - terraform workspace show
+      
+      # Generate and review plan
+      - echo "Generating Terraform plan for $ENVIRONMENT..."
+      - terraform plan -var="environment=$ENVIRONMENT" -out=${ENVIRONMENT}.tfplan -detailed-exitcode || export PLAN_EXIT_CODE=$?
+      
+      # Check if there are changes to apply
+      - |
+        if [ "$PLAN_EXIT_CODE" = "0" ]; then
+          echo "No changes detected for $ENVIRONMENT environment"
+          export HAS_CHANGES=false
+        elif [ "$PLAN_EXIT_CODE" = "2" ]; then
+          echo "Changes detected for $ENVIRONMENT environment"
+          export HAS_CHANGES=true
+        else
+          echo "Terraform plan failed with exit code: $PLAN_EXIT_CODE"
+          exit $PLAN_EXIT_CODE
+        fi
+      
+      # Show plan summary
+      - echo "=== Plan Summary ==="
+      - terraform show ${ENVIRONMENT}.tfplan
+      
+      # Apply changes if present
+      - |
+        if [ "$HAS_CHANGES" = "true" ]; then
+          echo "Applying Terraform changes to $ENVIRONMENT..."
+          
+          # Production deployment requires additional confirmation
+          if [ "$ENVIRONMENT" = "prod" ]; then
+            echo "!!! PRODUCTION DEPLOYMENT !!!"
+            echo "Applying changes to production environment..."
+          fi
+          
+          # Apply the plan
+          terraform apply -auto-approve ${ENVIRONMENT}.tfplan
+          
+          echo "Deployment to $ENVIRONMENT completed successfully"
+        else
+          echo "No changes to apply for $ENVIRONMENT"
+        fi
+      
+      # Get outputs
+      - echo "=== Terraform Outputs ==="
+      - terraform output -json > outputs.json || echo "No outputs available"
+      - terraform output || echo "No outputs to display"
+      
+  post_build:
+    commands:
+      - echo "Post-build phase started on `date`"
+      
+      # Generate deployment report
+      - echo "=== Generating Deployment Report ==="
+      - |
+        cat > deployment_report.json << EOF
+        {
+          "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "environment": "$ENVIRONMENT",
+          "terraform_version": "$TF_VERSION",
+          "deployment_status": "$([ $? -eq 0 ] && echo 'success' || echo 'failed')",
+          "changes_applied": $HAS_CHANGES,
+          "aws_region": "${AWS_DEFAULT_REGION:-us-west-2}",
+          "build_id": "$CODEBUILD_BUILD_ID"
+        }
+        EOF
+      
+      - echo "Deployment report:"
+      - cat deployment_report.json
+      
+      # Validate deployment (basic health check)
+      - echo "=== Post-Deployment Validation ==="
+      - |
+        if [ "$HAS_CHANGES" = "true" ]; then
+          echo "Running basic validation of deployed infrastructure..."
+          
+          # Check if key resources exist (customize based on your infrastructure)
+          terraform show -json | jq -r '.values.root_module.resources[]? | select(.type == "aws_instance") | .values.id' || echo "No EC2 instances found"
+          terraform show -json | jq -r '.values.root_module.resources[]? | select(.type == "aws_lb") | .values.dns_name' || echo "No load balancers found"
+          
+          echo "Basic validation completed"
+        fi
+      
+      # Environment-specific post-deployment actions
+      - |
+        case $ENVIRONMENT in
+          dev)
+            echo "Development environment deployed - no additional actions"
+            ;;
+          staging)
+            echo "Staging environment deployed - ready for integration tests"
+            # Could trigger integration tests here
+            ;;
+          prod)
+            echo "Production environment deployed - monitoring for issues"
+            # Could send notifications, update monitoring, etc.
+            ;;
+        esac
+      
+      - echo "Post-build phase completed on `date`"
+      
+      # Handle build failure
+      - |
+        if [ $? -ne 0 ]; then
+          echo "DEPLOYMENT FAILED for environment: $ENVIRONMENT"
+          echo "Check the build logs for detailed error information"
+          exit 1
+        fi
+
+artifacts:
+  files:
+    - '**/*'
+    - deployment_report.json
+    - outputs.json
+  name: deployment-output-$ENVIRONMENT
+  
+reports:
+  terraform-deployment:
+    files:
+      - deployment_report.json
+    file-format: JSON

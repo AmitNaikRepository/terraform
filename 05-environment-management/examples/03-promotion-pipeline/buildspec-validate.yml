@@ -1,0 +1,142 @@
+version: 0.2
+
+# BuildSpec for Terraform validation and planning
+# This buildspec validates Terraform configuration and generates execution plans
+
+env:
+  variables:
+    TF_VERSION: "1.5.0"
+    TF_IN_AUTOMATION: "true"
+    TF_INPUT: "false"
+    TF_CLI_ARGS: "-no-color"
+  
+phases:
+  install:
+    runtime-versions:
+      python: 3.8
+    commands:
+      - echo "Installing dependencies..."
+      - apt-get update -y
+      - apt-get install -y curl unzip wget git
+      
+      # Install Terraform
+      - echo "Installing Terraform ${TF_VERSION}..."
+      - wget -q https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip
+      - unzip terraform_${TF_VERSION}_linux_amd64.zip
+      - mv terraform /usr/local/bin/
+      - terraform version
+      
+      # Install tflint for additional validation
+      - echo "Installing tflint..."
+      - curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+      - tflint --version
+      
+      # Install checkov for security scanning
+      - echo "Installing checkov for security scanning..."
+      - pip install checkov
+      
+  pre_build:
+    commands:
+      - echo "Pre-build phase started on `date`"
+      - echo "Current directory: $(pwd)"
+      - echo "Listing directory contents:"
+      - ls -la
+      
+      # Set up Terraform working directory
+      - cd terraform || echo "No terraform directory found, using root"
+      - pwd
+      - ls -la
+      
+  build:
+    commands:
+      - echo "Build phase started on `date`"
+      - echo "=== Terraform Validation and Planning ==="
+      
+      # Initialize Terraform
+      - echo "Initializing Terraform..."
+      - terraform init -backend=false
+      
+      # Format check
+      - echo "Checking Terraform formatting..."
+      - terraform fmt -check=true -diff=true || (echo "Terraform files are not formatted correctly. Run 'terraform fmt' to fix." && exit 1)
+      
+      # Validate Terraform configuration
+      - echo "Validating Terraform configuration..."
+      - terraform validate
+      
+      # Run tflint for additional validation
+      - echo "Running tflint for advanced validation..."
+      - tflint --init
+      - tflint || echo "tflint found issues but continuing..."
+      
+      # Run checkov for security scanning
+      - echo "Running security scan with checkov..."
+      - checkov -d . --framework terraform --compact --quiet || echo "Security scan found issues but continuing..."
+      
+      # Generate plan for each environment
+      - echo "=== Generating Terraform Plans ==="
+      
+      # Dev environment plan
+      - echo "Generating plan for dev environment..."
+      - terraform plan -var="environment=dev" -out=dev.tfplan -detailed-exitcode || export DEV_PLAN_EXIT=$?
+      - if [ "$DEV_PLAN_EXIT" = "2" ]; then echo "Dev plan has changes"; else echo "Dev plan has no changes"; fi
+      
+      # Staging environment plan  
+      - echo "Generating plan for staging environment..."
+      - terraform plan -var="environment=staging" -out=staging.tfplan -detailed-exitcode || export STAGING_PLAN_EXIT=$?
+      - if [ "$STAGING_PLAN_EXIT" = "2" ]; then echo "Staging plan has changes"; else echo "Staging plan has no changes"; fi
+      
+      # Production environment plan
+      - echo "Generating plan for production environment..."
+      - terraform plan -var="environment=prod" -out=prod.tfplan -detailed-exitcode || export PROD_PLAN_EXIT=$?
+      - if [ "$PROD_PLAN_EXIT" = "2" ]; then echo "Production plan has changes"; else echo "Production plan has no changes"; fi
+      
+      # Show plan summaries
+      - echo "=== Plan Summaries ==="
+      - echo "Dev plan summary:"
+      - terraform show -json dev.tfplan | jq -r '.planned_values.root_module.resources | length' || echo "No changes"
+      
+      - echo "Staging plan summary:"
+      - terraform show -json staging.tfplan | jq -r '.planned_values.root_module.resources | length' || echo "No changes"
+      
+      - echo "Production plan summary:"
+      - terraform show -json prod.tfplan | jq -r '.planned_values.root_module.resources | length' || echo "No changes"
+      
+  post_build:
+    commands:
+      - echo "Post-build phase started on `date`"
+      
+      # Generate validation report
+      - echo "=== Generating Validation Report ==="
+      - |
+        cat > validation_report.json << EOF
+        {
+          "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "terraform_version": "$TF_VERSION",
+          "validation_status": "passed",
+          "format_check": "passed",
+          "lint_status": "completed",
+          "security_scan": "completed",
+          "plans_generated": {
+            "dev": $([ "$DEV_PLAN_EXIT" = "2" ] && echo "true" || echo "false"),
+            "staging": $([ "$STAGING_PLAN_EXIT" = "2" ] && echo "true" || echo "false"),
+            "prod": $([ "$PROD_PLAN_EXIT" = "2" ] && echo "true" || echo "false")
+          }
+        }
+        EOF
+      
+      - echo "Validation report:"
+      - cat validation_report.json
+      
+      - echo "Validation phase completed successfully on `date`"
+
+artifacts:
+  files:
+    - '**/*'
+  name: validation-output
+  
+reports:
+  terraform-validation:
+    files:
+      - validation_report.json
+    file-format: JSON
